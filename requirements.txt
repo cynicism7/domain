@@ -1,0 +1,13 @@
+# 文献领域识别 - 依赖
+# 配置
+pyyaml>=6.0
+# 文本提取
+pypdf>=4.0.0
+python-docx>=1.1.0
+
+# 本地大模型调用（Ollama 或 OpenAI 兼容 API）
+requests>=2.31.0
+ollama>=0.3.0
+
+# 可选：若使用 OpenAI 兼容 API（如 LM Studio）
+openai>=1.0.0

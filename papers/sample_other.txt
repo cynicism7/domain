@@ -1,0 +1,7 @@
+A General Survey on Modern Methods
+
+Abstract
+We survey various approaches and methodologies across different disciplines, with a focus on systematic comparison.
+
+Introduction
+This document provides an overview of several topics. Section 2 discusses methodology.

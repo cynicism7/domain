@@ -1,0 +1,10 @@
+Deep Learning for Network Optimization
+
+Abstract
+This paper presents a novel algorithm for optimizing neural network architectures. We apply deep learning to improve routing and resource allocation in computer networks.
+
+Introduction
+1. Background
+Network optimization has been a central topic in computer science. Recent advances in machine learning offer new approaches to this problem.
+
+Keywords: deep learning, algorithm, network optimization

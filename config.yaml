@@ -1,33 +1,14 @@
-# 文献领域识别 - 配置文件
-
-# 文献目录（可填多个）
 literature_dirs:
   - "./papers"
-
-# 支持的文件扩展名
 extensions:
-  - .pdf
-  - .docx
-  - .doc
-  - .txt
-
-# 本地大模型配置
+  - ".pdf"
 llm:
-  # 可选: ollama | openai_api | mock（mock=不调用大模型，用简单规则模拟，便于本地验证）
-  provider: ollama
-  # Ollama 模型名（当 provider=ollama 时）
-  model: qwen2.5:7b
-  # OpenAI 兼容 API（当 provider=openai_api 时，如 LM Studio）
-  api_base: "http://localhost:1234/v1"
-  api_key: "not-needed"
-
-# 领域识别依据：标题 + 摘要 + 正文前两页；总采样字数（摘要与正文前两页合计）
-max_chars_for_llm: 4000
-
-# 输出
+  provider: "openai_api"
+  model: "DeepSeek-R1-0528-Qwen3-8B"
+  api_base: "http://127.0.0.1:1234/v1"
+  api_key: "lm-studio"
+max_chars_for_llm: 3000
 output:
-  # 数据库路径
   db_path: "./literature_domains.db"
-  # 是否同时导出 CSV
-  export_csv: true
+  export_csv: True
   csv_path: "./literature_domains.csv"

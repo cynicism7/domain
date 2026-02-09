@@ -1,177 +1,144 @@
 # -*- coding: utf-8 -*-
-"""从 PDF、DOCX、TXT 中提取「标题、摘要、正文前两页」，供领域识别使用。"""
+"""
+PDF 阶梯式识别提取器（增强稳定性版）：
+1. 文本层 (PyMuPDF -> 回退到 pypdf)
+2. 主 OCR (Nougat)
+3. 备用 OCR (DocTR)
+4. 兜底 (Tesseract)
+"""
 
-import re
 from pathlib import Path
 from typing import Tuple
+import os
 
+# 阈值：如果提取文本少于此字符数，则认为需要 OCR
+MIN_TEXT_THRESHOLD = 200
 
-# 正文前两页约等于的字符数（中英文混合）
-CHARS_PER_PAGE = 1200
-
-
-def _find_abstract_and_body(full_text: str, abstract_max: int = 1500, body_max: int = 2400) -> Tuple[str, str]:
-    """从全文里解析摘要段和正文前两页。"""
-    text = (full_text or "").strip()
-    abstract = ""
-    body = ""
-    # 摘要起始关键词（中英文）
-    abstract_starts = re.compile(
-        r"(?:^|\n)\s*(?:Abstract|ABSTRACT|摘要|【摘要】)\s*[：:\s]*\n?",
-        re.IGNORECASE
-    )
-    # 摘要结束 / 正文开始关键词
-    body_starts = re.compile(
-        r"(?:Introduction|INTRODUCTION|1\.\s+Introduction|引言|前言|Keywords|Key words|索引词|I\.\s+)",
-        re.IGNORECASE
-    )
-    match_start = abstract_starts.search(text)
-    if match_start:
-        after_abstract_label = text[match_start.end():]
-        match_end = body_starts.search(after_abstract_label)
-        if match_end:
-            abstract = after_abstract_label[: match_end.start()].strip()[:abstract_max]
-            body = after_abstract_label[match_end.start() :].strip()[:body_max]
-        else:
-            # 没有明确正文起始，摘要取到一定长度，正文用摘要后的内容
-            abstract = after_abstract_label[:abstract_max].strip()
-            body = after_abstract_label[abstract_max : abstract_max + body_max].strip()
-    else:
-        # 没有找到摘要标题，前一段当摘要，后面当正文前两页
-        abstract = text[:abstract_max].strip()
-        body = text[abstract_max : abstract_max + body_max].strip()
-    return abstract, body
-
-
-def extract_txt(path: str, max_chars: int = 5000) -> str:
-    """从纯文本文件读取内容。"""
-    path = Path(path)
-    if not path.exists():
-        return ""
+def extract_via_text_layer(path: Path, max_pages: int) -> str:
+    """第一层：文本提取（多重备份方案）"""
+    text = ""
+    # 尝试方案 A: PyMuPDF (性能最好，但可能报 DLL 错误)
     try:
-        for enc in ("utf-8", "gbk", "gb2312", "latin-1"):
-            try:
-                text = path.read_text(encoding=enc)
-                return text[:max_chars] if max_chars else text
-            except UnicodeDecodeError:
-                continue
+        import fitz
+        doc = fitz.open(str(path))
+        actual_max = min(len(doc), max_pages)
+        for i in range(actual_max):
+            text += doc[i].get_text()
+        doc.close()
+        if len(text.strip()) > MIN_TEXT_THRESHOLD:
+            print(f"[PyMuPDF 成功] ", end="")
+            return text.strip()
+    except Exception as e:
+        print(f" [PyMuPDF 失败: {e}] ", end="")
+
+    # 尝试方案 B: pypdf (纯 Python，不依赖 DLL，极稳)
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(path)
+        actual_max = min(len(reader.pages), max_pages)
+        parts = []
+        for i in range(actual_max):
+            t = reader.pages[i].extract_text()
+            if t: parts.append(t)
+        text = "\n".join(parts)
+        if len(text.strip()) > MIN_TEXT_THRESHOLD:
+            print(f"[pypdf 成功] ", end="")
+            return text.strip()
+    except Exception as e:
+        print(f" [pypdf 失败: {e}] ", end="")
+
+    return text.strip()
+
+def extract_via_nougat(path: Path, max_pages: int) -> str:
+    """第二层：Nougat (主 OCR)"""
+    try:
+        import subprocess
+        # 探测命令是否存在
+        result = subprocess.run(
+            ["nougat", str(path), "--pages", f"1-{max_pages}", "--markdown"],
+            capture_output=True, text=True, encoding="utf-8", timeout=300
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
     except Exception:
         pass
     return ""
 
-
-def extract_pdf(path: str, max_chars: int = 5000) -> str:
-    """从 PDF 提取前几页文本。"""
+def extract_via_doctr(path: Path, max_pages: int) -> str:
+    """第三层：DocTR (备用 OCR)"""
     try:
-        from pypdf import PdfReader
-    except ImportError:
-        return ""
-    path = Path(path)
-    if not path.exists():
-        return ""
-    try:
-        reader = PdfReader(path)
-        parts = []
-        n = 0
-        for page in reader.pages:
-            if n >= 5:  # 最多 5 页
-                break
-            t = page.extract_text()
-            if t:
-                parts.append(t)
-                n += 1
-        text = "\n".join(parts)
-        return text[:max_chars] if max_chars else text
+        from doctr.io import DocumentFile
+        from doctr.models import ocr_predictor
+        model = ocr_predictor(pretrained=True)
+        doc = DocumentFile.from_pdf(str(path))
+        result = model(doc[:max_pages])
+        return result.render()
     except Exception:
-        return ""
-
-
-def extract_docx(path: str, max_chars: int = 5000) -> str:
-    """从 DOCX 提取段落文本。"""
-    try:
-        from docx import Document
-    except ImportError:
-        return ""
-    path = Path(path)
-    if not path.exists():
-        return ""
-    try:
-        doc = Document(path)
-        parts = [p.text for p in doc.paragraphs if p.text.strip()]
-        text = "\n".join(parts)
-        return text[:max_chars] if max_chars else text
-    except Exception:
-        return ""
-
-
-def extract_text(file_path: str, max_chars: int = 5000) -> str:
-    """根据扩展名选择提取器并返回文本（兼容旧接口）。"""
-    path = Path(file_path)
-    suffix = path.suffix.lower()
-    if suffix == ".txt":
-        return extract_txt(file_path, max_chars)
-    if suffix == ".pdf":
-        return extract_pdf(file_path, max_chars)
-    if suffix in (".docx", ".doc"):
-        return extract_docx(file_path, max_chars)
+        pass
     return ""
 
+def extract_via_tesseract(path: Path, max_pages: int) -> str:
+    """第四层：Tesseract (兜底)"""
+    try:
+        import pytesseract
+        import fitz  # 如果 fitz 挂了，这里尝试用 pypdf 渲染图片的方案（简化版暂用 fitz）
+        from PIL import Image
+        doc = fitz.open(str(path))
+        text = ""
+        actual_max = min(len(doc), max_pages)
+        for i in range(actual_max):
+            page = doc[i]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            text += pytesseract.image_to_string(img, lang='eng')
+        doc.close()
+        return text.strip()
+    except Exception:
+        pass
+    return ""
 
-def extract_title_abstract_body(
-    file_path: str,
-    abstract_max: int = 1500,
-    body_pages_chars: int = None,
-) -> Tuple[str, str, str]:
-    """
-    提取「标题、摘要、正文前两页」三部分，用于领域判断。
-    返回 (title, abstract, body_first_2_pages)。
-    """
-    body_max = body_pages_chars or (CHARS_PER_PAGE * 2)
-    path = Path(file_path)
-    name = path.name
-    suffix = path.suffix.lower()
+def extract_pdf(path: str, max_pages: int = 5) -> str:
+    """阶梯逻辑入口"""
+    path_obj = Path(path)
+    if not path_obj.exists(): return ""
 
-    title = name
-    full_text = ""
+    # 1. 尝试文本层
+    print(f" (Try Text Layer) ", end="", flush=True)
+    text = extract_via_text_layer(path_obj, max_pages)
+    if len(text) > MIN_TEXT_THRESHOLD:
+        return text
 
-    if suffix == ".txt":
-        full_text = extract_txt(file_path, max_chars=abstract_max + body_max + 2000)
-        lines = full_text.splitlines()
-        if lines:
-            first_line = lines[0].strip()
-            if len(first_line) < 200 and first_line:
-                title = first_line
-    elif suffix == ".pdf":
+    # 2. 尝试 Nougat
+    print(f" (Try Nougat) ", end="", flush=True)
+    text = extract_via_nougat(path_obj, max_pages)
+    if len(text) > MIN_TEXT_THRESHOLD:
+        print(f"[Nougat 成功] ", end="")
+        return text
+
+    # 3. 尝试 DocTR
+    print(f" (Try DocTR) ", end="", flush=True)
+    text = extract_via_doctr(path_obj, max_pages)
+    if len(text) > MIN_TEXT_THRESHOLD:
+        print(f"[DocTR 成功] ", end="")
+        return text
+
+    # 4. 尝试 Tesseract
+    print(f" (Try Tesseract) ", end="", flush=True)
+    text = extract_via_tesseract(path_obj, max_pages)
+    
+    # 记录结果供调试
+    if text.strip():
+        debug_txt = path_obj.with_suffix(path_obj.suffix + ".ocr.txt")
         try:
-            from pypdf import PdfReader
-            reader = PdfReader(path)
-            meta = reader.metadata
-            if meta and getattr(meta, "title", None) and str(meta.title).strip():
-                title = str(meta.title).strip()
-            pages_text = []
-            for i, page in enumerate(reader.pages):
-                if i >= 5:
-                    break
-                t = page.extract_text()
-                if t:
-                    pages_text.append(t)
-            full_text = "\n".join(pages_text)
-        except Exception:
-            full_text = ""
-    elif suffix in (".docx", ".doc"):
-        try:
-            from docx import Document
-            doc = Document(path)
-            paras = [p.text for p in doc.paragraphs if p.text.strip()]
-            if paras:
-                first = paras[0].strip()
-                if len(first) < 200 and first:
-                    title = first
-            full_text = "\n".join(paras)
-        except Exception:
-            full_text = ""
+            debug_txt.write_text(text, encoding="utf-8")
+        except: pass
     else:
-        full_text = extract_text(file_path, max_chars=abstract_max + body_max + 2000)
+        print("[所有识别层均告失败] ", end="")
+            
+    return text
 
-    abstract, body = _find_abstract_and_body(full_text, abstract_max=abstract_max, body_max=body_max)
-    return title, abstract, body
+def extract_title_abstract_body(file_path: str, **kwargs) -> Tuple[str, str, str]:
+    """适配接口"""
+    path = Path(file_path)
+    full_text = extract_pdf(file_path, max_pages=5)
+    return path.name, full_text, ""

@@ -5,7 +5,6 @@
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 from extractors import extract_title_abstract_body
@@ -85,21 +84,20 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
     for i, fp in enumerate(files, 1):
         name = Path(fp).name
         print(f"[{i}/{total}] {name} ... ", end="", flush=True)
-        title, abstract, body = extract_title_abstract_body(
+        title, abstract, _ = extract_title_abstract_body(
             fp, abstract_max=abstract_chars, body_pages_chars=body_chars
         )
         provider = "mock" if use_mock else llm_cfg.get("provider", "ollama")
-        domain = identify_domain(
+        domain_cn, domain_en = identify_domain(
             title,
             abstract,
-            body,
             provider=provider,
             model=llm_cfg.get("model", "qwen2.5:7b"),
             api_base=llm_cfg.get("api_base", "http://localhost:1234/v1"),
             api_key=llm_cfg.get("api_key", "not-needed"),
         )
-        upsert_domain(conn, fp, domain)
-        print(domain)
+        upsert_domain(conn, fp, domain_cn, domain_en)
+        print(f"{domain_cn} | {domain_en}")
     conn.close()
 
     if do_csv:
@@ -144,7 +142,7 @@ def main():
 
     p_scan = sub.add_parser("scan", help="扫描文献目录，识别领域并写入数据库")
     p_scan.add_argument("--mock", "-m", action="store_true", help="模拟模式：不调用大模型，用简单规则生成领域，便于本地验证")
-    p_list = sub.add_parser("domains", help="列出所有已记录的领域")
+    sub.add_parser("domains", help="列出所有已记录的领域")
     p_query = sub.add_parser("filter", help="按领域筛选文献")
     p_query.add_argument("domain", help="领域名称，如：计算机科学")
 

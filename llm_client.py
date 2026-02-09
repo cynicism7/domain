@@ -69,44 +69,63 @@ def ask_openai_api(
         return f"[API 请求失败: {e}]"
 
 
+import json
+
+
 def identify_domain(
     title: str,
-    abstract: str,
-    body_first_2_pages: str,
+    full_text: str,
     *,
     provider: str = "ollama",
     model: str = "qwen2.5:7b",
     api_base: str = "http://localhost:1234/v1",
     api_key: str = "not-needed",
-) -> str:
+) -> tuple[str, str]:
     """
-    结合标题、摘要和正文前两页，调用本地大模型判断文献所属领域，返回一个简短领域标签。
+    调用本地大模型识别领域，返回 (domain_cn, domain_en)。
     """
-    prompt = """请根据下面文献的【标题】、【摘要】和【正文前两页】内容，判断该文献所属的学科或领域。
-只回复一个最贴切的领域名称（例如：计算机科学、生物信息学、经济学、物理学、医学、法学等），不要解释，不要换行。
+    prompt = """请根据下面文献的内容，判断其所属的学术领域。
+要求：
+1. 返回一个标准的学术领域名称（如：计算机科学/Computer Science, 生物信息学/Bioinformatics）。
+2. 必须以 JSON 格式返回，包含 "domain_cn" 和 "domain_en" 两个字段。
+3. 领域名称要准确、专业。
 
-【标题】
+【文件名或标题 / Title or Filename】
 %s
 
-【摘要】
+【前五页OCR全文 / OCR Full Text (First 5 Pages)】
 %s
 
-【正文前两页】
-%s
-
-领域：""" % (
-        (title or "（无标题）").strip(),
-        (abstract or "（无摘要）").strip(),
-        (body_first_2_pages or "（无正文）").strip(),
+JSON Output:""" % (
+        (title or "Unknown").strip(),
+        (full_text or "No Content Detected").strip(),
     )
 
     if provider == "mock":
-        return _identify_domain_mock(title or "", abstract or "", body_first_2_pages or "")
+        return _identify_domain_mock(title or "", "", full_text or ""), "Test Domain"
+    
+    raw = ""
     if provider == "openai_api":
         raw = ask_openai_api(prompt, model=model, api_base=api_base, api_key=api_key)
     else:
         raw = ask_ollama(prompt, model=model)
-    return _normalize_domain(str(raw))
+    
+    # 解析 JSON
+    try:
+        # 寻找 JSON 块
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            data = json.loads(match.group(0))
+            return data.get("domain_cn", "未分类"), data.get("domain_en", "Unclassified")
+    except:
+        pass
+    
+    # 兜底：简单切割
+    if "|" in raw:
+        parts = raw.split("|")
+        return parts[0].strip(), parts[1].strip()
+    
+    return _normalize_domain(raw), "Unclassified"
 
 
 def _identify_domain_mock(title: str, abstract: str, body: str) -> str:

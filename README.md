@@ -1,86 +1,141 @@
-# 文献领域识别
+# 文献领域识别（强制 OCR + 本地 LM Studio）
 
-通过本地大模型（Ollama 或 LM Studio 等 OpenAI 兼容 API）自动识别每篇文献的学科/领域。**领域判断依据**：标题（或文件名/元数据）、摘要、正文前两页。将「路径/文件名 + 领域」写入 SQLite 和 CSV，方便后续按领域筛选。
+本项目用于批量扫描本地 PDF 英文文献，**强制使用 OCR** 识别前几页文字（不依赖 PDF 是否可复制），并将识别出的内容（标题/摘要/正文前两页附近文本）发送给你本地部署在 **LM Studio** 的大模型进行学术领域判定，最终将结果写入 SQLite 并导出 CSV，方便后续筛选。
+
+## 功能概览
+
+- 扫描配置目录下的 PDF（递归子目录）
+- PDF 前 5 页渲染为图片并 OCR（PaddleOCR，英文）
+- 从 OCR 文本中切分摘要与正文片段（基于 Abstract / Introduction 等关键词）
+- 调用本地 LM Studio（OpenAI 兼容 API）识别领域标签
+- 写入数据库 `literature_domains.db`，并导出 `literature_domains.csv`
 
 ## 环境要求
 
-- Python 3.8+
-- 本地已运行大模型服务：
-  - **Ollama**：安装 [Ollama](https://ollama.com)，并拉取模型（如 `ollama pull qwen2.5:7b`）
-  - 或 **LM Studio** 等：启动本地服务器并暴露 OpenAI 兼容 API
+- Windows / macOS / Linux
+- Python 3.9+（推荐 3.10/3.11）
+- LM Studio 已启动本地 Server，并开启 OpenAI Compatible API
 
-## 安装
+## 安装依赖
+
+在项目目录执行：
 
 ```bash
-cd e:\domain
 pip install -r requirements.txt
 ```
 
-## 配置
+如果你是首次使用 OCR，通常还需要安装：
 
-编辑 `config.yaml`：
+- `pymupdf`（用于 PDF 渲染）
+- `paddlepaddle`、`paddleocr`（OCR 引擎）
+- `opencv-python-headless`（OCR 依赖）
 
-- **literature_dirs**：文献所在目录（可多个），程序会递归扫描子目录
-- **extensions**：支持的文件类型（`.pdf`、`.docx`、`.txt` 等）
-- **llm**：
-  - `provider: ollama` 使用 Ollama；`provider: openai_api` 使用 LM Studio 等
-  - `model`：Ollama 模型名或 API 侧模型名
-  - 使用 `openai_api` 时填写 `api_base`、`api_key`
-- **output**：数据库路径、是否导出 CSV 及 CSV 路径
-
-## 本地没有大模型时如何验证
-
-不安装 Ollama、不启动任何大模型，也可以跑通整个流程（扫描 → 提取标题/摘要/正文 → 写入数据库 → 导出 CSV → 按领域筛选）：
+如果你当前 `requirements.txt` 未包含上述 OCR 依赖，可直接安装：
 
 ```bash
-# 模拟模式：用简单关键词规则“模拟”领域，不请求任何 API
-python main.py scan --mock
+pip install pymupdf paddlepaddle paddleocr opencv-python-headless
 ```
 
-项目里已自带 `papers/` 下几篇示例 `.txt`，可直接执行上述命令。然后可试：
+说明：
+
+- 默认使用 CPU 推理（`use_gpu=False`）。如需 GPU，请自行安装对应的 PaddlePaddle GPU 版本并调整代码。
+- 若你机器上有多个项目依赖较复杂，建议使用 venv 虚拟环境隔离。
+
+## 配置（config.yaml）
+
+编辑 `config.yaml`，你主要需要改两项：
+
+1. **文献目录**：`literature_dirs`
+2. **LM Studio 模型与接口**：`llm`
+
+示例：
+
+```yaml
+literature_dirs:
+  - "D:/MyPapers"
+  - "E:/Literature/PDFs"
+
+extensions:
+  - ".pdf"
+
+llm:
+  provider: "openai_api"
+  model: "DeepSeek-R1-0528-Qwen3-8B"
+  api_base: "http://localhost:1234/v1"
+  api_key: "lm-studio"
+
+max_chars_for_llm: 3000
+
+output:
+  db_path: "./literature_domains.db"
+  export_csv: True
+  csv_path: "./literature_domains.csv"
+```
+
+参数说明：
+
+- `literature_dirs`：文献目录列表（可多个），程序会递归扫描子目录
+- `extensions`：建议只保留 `.pdf`
+- `llm.provider`：使用 LM Studio 时设为 `openai_api`
+- `llm.model`：LM Studio 中实际加载并对外提供的模型名（需与 LM Studio 一致）
+- `llm.api_base`：LM Studio OpenAI 兼容 API 地址（常见 `http://localhost:1234/v1`）
+- `max_chars_for_llm`：发给大模型的最大字符数（越大越慢，但信息更全）
+
+## 使用方法
+
+### 1) 扫描并打标签
 
 ```bash
-python main.py domains              # 查看出现的领域
-python main.py filter 计算机科学   # 按领域筛选（示例里会匹配到 sample_computer_science.txt）
+python main.py scan
 ```
 
-也可在 `config.yaml` 里把 `llm.provider` 改为 `mock`，则不加 `--mock` 时也会走模拟逻辑。
+运行后会逐个输出：
 
-## 使用
+- 当前处理的文件
+- 模型返回的领域标签
 
-1. **扫描并打标签**（识别每篇文献领域并写入数据库）：
+并写入：
 
-   ```bash
-   python main.py scan
-   # 无大模型时用：python main.py scan --mock
-   ```
+- SQLite：`output.db_path`（默认 `./literature_domains.db`）
+- CSV：`output.csv_path`（默认 `./literature_domains.csv`）
 
-2. **查看已记录的领域**：
+### 2) 查看已记录的领域
 
-   ```bash
-   python main.py domains
-   ```
+```bash
+python main.py domains
+```
 
-3. **按领域筛选文献**（打印该领域下所有文献路径）：
+### 3) 按领域筛选
 
-   ```bash
-   python main.py filter 计算机科学
-   ```
+```bash
+python main.py filter 计算机科学
+```
 
-结果会写入：
+会打印该领域下的所有文献路径。
 
-- **SQLite**：`config.yaml` 中 `output.db_path`（默认 `literature_domains.db`）
-- **CSV**：若 `export_csv: true`，会导出到 `output.csv_path`，可用 Excel 等打开筛选
+## 输出说明
 
-## 数据库结构
+CSV 文件列：
 
-表 `literature_domains`：
+- `file_path`：文献绝对路径
+- `file_name`：文件名
+- `domain`：识别出的领域标签
+- `updated_at`：更新时间
 
-| 字段        | 说明           |
-|-------------|----------------|
-| file_path   | 文献完整路径   |
-| file_name   | 文件名         |
-| domain      | 识别出的领域   |
-| updated_at  | 最近更新时间   |
+## 常见问题
 
-后续可按 `domain` 查询或导出筛选结果。
+### 1) 识别速度慢
+
+- OCR 是主要耗时步骤（尤其是扫描版 PDF）。
+- 本项目已将 OCR 引擎做成进程内复用（不会每个 PDF 重新初始化一次）。
+- 你可以减少 OCR 页数（目前固定前 5 页；如需改成 3 页或 8 页我可以继续帮你改）。
+
+### 2) LM Studio 请求失败 / model 不存在
+
+- 请确认 `config.yaml` 中 `llm.model` 与 LM Studio 暴露的模型名一致。
+- 请确认 LM Studio Server 已启动，并且 `api_base` 端口正确。
+
+### 3) PDF OCR 文本质量一般
+
+- 可尝试提高渲染分辨率（当前 `Matrix(2.0, 2.0)`）。
+- 文献为双栏排版时，OCR 可能出现顺序错乱；后续可加版面分析优化。

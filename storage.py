@@ -92,10 +92,10 @@ def export_csv(db_path: str, csv_path: str) -> None:
 
 
 def query_by_domain(db_path: str, domain: str) -> List[Tuple[str, str, str]]:
-    """按领域筛选，返回 (file_path, file_name, domain) 列表。"""
+    """按领域筛选（按 domain_cn 匹配），返回 (file_path, file_name, domain_cn) 列表。"""
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
-        "SELECT file_path, file_name, domain FROM literature_domains WHERE domain = ? ORDER BY file_name",
+        "SELECT file_path, file_name, domain_cn FROM literature_domains WHERE domain_cn = ? ORDER BY file_name",
         (domain,),
     ).fetchall()
     conn.close()
@@ -103,8 +103,8 @@ def query_by_domain(db_path: str, domain: str) -> List[Tuple[str, str, str]]:
 
 
 def list_domains(db_path: str) -> List[str]:
-    """返回所有出现过的领域列表（去重）。"""
+    """返回所有出现过的领域列表（按 domain_cn 去重）。"""
     conn = sqlite3.connect(db_path)
-    rows = conn.execute("SELECT DISTINCT domain FROM literature_domains ORDER BY domain").fetchall()
+    rows = conn.execute("SELECT DISTINCT domain_cn FROM literature_domains WHERE domain_cn IS NOT NULL ORDER BY domain_cn").fetchall()
     conn.close()
     return [r[0] for r in rows]

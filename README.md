@@ -1,70 +1,48 @@
-# 文献领域识别（强制 OCR + 本地 LM Studio）
+# 文献领域识别（生命科学 / 非生命科学 二分类）
 
-本项目用于批量扫描本地 PDF 英文文献，**强制使用 OCR** 识别前几页文字（不依赖 PDF 是否可复制），并将识别出的内容（标题/摘要/正文前两页附近文本）发送给你本地部署在 **LM Studio** 的大模型进行学术领域判定，最终将结果写入 SQLite 并导出 CSV，方便后续筛选。
+批量扫描本地 PDF 文献，提取文本（含**作者与机构信息**）后送交本地大模型，判断是否属于**生命科学**相关，结果写入 SQLite 并导出 CSV，便于筛选生命科学文献。
 
 ## 功能概览
 
-- 扫描配置目录下的 PDF（递归子目录）
-- PDF 前 5 页渲染为图片并 OCR（PaddleOCR，英文）
-- 从 OCR 文本中切分摘要与正文片段（基于 Abstract / Introduction 等关键词）
-- 调用本地 LM Studio（OpenAI 兼容 API）识别领域标签
-- 写入数据库 `literature_domains.db`，并导出 `literature_domains.csv`
+- **扫描**：递归扫描配置目录下的 PDF（可配置扩展名）
+- **提取**：优先从 PDF 文本层取文（PyMuPDF / pypdf），不足时使用 Tesseract OCR 兜底；按 RAG 思路分块后整合，**显式包含「作者与机构信息」**（标题、作者、单位、期刊等），便于结合 xx 医院、xx 大学医学系等判断
+- **分类**：调用本地大模型（LM Studio / Ollama，OpenAI 兼容 API）做**二分类**：**生命科学** 或 **非生命科学**（医学、生物、药学、农学、生物信息等归为生命科学，其余为非生命科学）
+- **输出**：写入 `literature_domains.db`，并导出 `literature_domains.csv`；支持按领域筛选（如只列生命科学文献）
 
 ## 环境要求
 
-- Windows / macOS / Linux
-- Python 3.9+（推荐 3.10/3.11）
-- LM Studio 已启动本地 Server，并开启 OpenAI Compatible API
+- Python 3.9+
+- 本地大模型服务：**LM Studio**（推荐，OpenAI 兼容 API）或 **Ollama**
 
 ## 安装依赖
-
-在项目目录执行：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-如果你是首次使用 OCR，通常还需要安装：
+- **PDF 文本**：`pymupdf`、`pypdf`（取文本层）
+- **OCR 兜底**（可选）：若 PDF 无文本层或文字过少，需安装 `pytesseract` 并安装 [Tesseract](https://github.com/tesseract-ocr/tesseract) 本体
+- **大模型调用**：`openai`（LM Studio）、`ollama`（Ollama）
 
-- `pymupdf`（用于 PDF 渲染）
-- `paddlepaddle`、`paddleocr`（OCR 引擎）
-- `opencv-python-headless`（OCR 依赖）
-
-如果你当前 `requirements.txt` 未包含上述 OCR 依赖，可直接安装：
-
-```bash
-pip install pymupdf paddlepaddle paddleocr opencv-python-headless
-```
-
-说明：
-
-- 默认使用 CPU 推理（`use_gpu=False`）。如需 GPU，请自行安装对应的 PaddlePaddle GPU 版本并调整代码。
-- 若你机器上有多个项目依赖较复杂，建议使用 venv 虚拟环境隔离。
+建议在 venv 中安装以免与其它项目冲突。
 
 ## 配置（config.yaml）
 
-编辑 `config.yaml`，你主要需要改两项：
-
-1. **文献目录**：`literature_dirs`
-2. **LM Studio 模型与接口**：`llm`
-
-示例：
-
 ```yaml
 literature_dirs:
-  - "D:/MyPapers"
-  - "E:/Literature/PDFs"
-
+  - "./papers"
 extensions:
   - ".pdf"
 
 llm:
-  provider: "openai_api"
+  provider: "openai_api"        # 或 ollama
   model: "DeepSeek-R1-0528-Qwen3-8B"
-  api_base: "http://localhost:1234/v1"
+  api_base: "http://127.0.0.1:1234/v1"
   api_key: "lm-studio"
+  max_tokens: 512               # R1 等思考型模型需 512 以容纳 <think>+JSON
+  temperature: 0.0
 
-max_chars_for_llm: 3000
+max_chars_for_llm: 2500        # 送交模型的字符上限，减小可提速
 
 output:
   db_path: "./literature_domains.db"
@@ -72,70 +50,70 @@ output:
   csv_path: "./literature_domains.csv"
 ```
 
-参数说明：
-
-- `literature_dirs`：文献目录列表（可多个），程序会递归扫描子目录
-- `extensions`：建议只保留 `.pdf`
-- `llm.provider`：使用 LM Studio 时设为 `openai_api`
-- `llm.model`：LM Studio 中实际加载并对外提供的模型名（需与 LM Studio 一致）
-- `llm.api_base`：LM Studio OpenAI 兼容 API 地址（常见 `http://localhost:1234/v1`）
-- `max_chars_for_llm`：发给大模型的最大字符数（越大越慢，但信息更全）
+| 项 | 说明 |
+|----|------|
+| `literature_dirs` | 文献根目录列表，会递归扫描子目录 |
+| `extensions` | 参与扫描的扩展名，通常只保留 `.pdf` |
+| `llm.provider` | `openai_api`（LM Studio）或 `ollama` |
+| `llm.model` | 与 LM Studio / Ollama 中加载的模型名一致 |
+| `llm.api_base` | LM Studio 的 API 地址，常见 `http://127.0.0.1:1234/v1` |
+| `llm.max_tokens` | 生成 token 上限；思考型模型建议 512，否则可 256 |
+| `llm.temperature` | 建议 0 以稳定输出 JSON |
+| `max_chars_for_llm` | 送交的文献内容最大字符数，适当减小可加快推理 |
 
 ## 使用方法
 
-### 1) 扫描并打标签
+### 扫描并打标签
 
 ```bash
 python main.py scan
 ```
 
-运行后会逐个输出：
+会逐个处理 PDF，打印「送交 N 字」及识别结果（生命科学 / 非生命科学），并写入数据库与 CSV。
 
-- 当前处理的文件
-- 模型返回的领域标签
+### 模拟模式（不调用大模型）
 
-并写入：
+```bash
+python main.py scan --mock
+```
 
-- SQLite：`output.db_path`（默认 `./literature_domains.db`）
-- CSV：`output.csv_path`（默认 `./literature_domains.csv`）
+按关键词规则模拟「生命科学 / 非生命科学」，用于验证流程。
 
-### 2) 查看已记录的领域
+### 查看已记录的领域
 
 ```bash
 python main.py domains
 ```
 
-### 3) 按领域筛选
+### 按领域筛选文献（筛出生命科学）
 
 ```bash
-python main.py filter 计算机科学
+python main.py filter 生命科学
 ```
 
-会打印该领域下的所有文献路径。
+会列出所有被标为「生命科学」的文献路径。筛「非生命科学」则：
+
+```bash
+python main.py filter 非生命科学
+```
 
 ## 输出说明
 
-CSV 文件列：
+- **SQLite**（`output.db_path`）：表内为 `file_path`、`file_name`、`domain_cn`、`domain_en`、`updated_at`
+- **CSV**（`output.csv_path`）：同上字段，便于 Excel 打开
 
-- `file_path`：文献绝对路径
-- `file_name`：文件名
-- `domain`：识别出的领域标签
-- `updated_at`：更新时间
+领域取值仅两种：**生命科学** / **非生命科学**（及对应英文 Life Science / Non-Life Science）。
 
 ## 常见问题
 
-### 1) 识别速度慢
+**Q: 日志里看到 "Truncated in logs"，送交的内容是否被截断？**  
+A: 那是 LM Studio 日志的显示截断，实际请求里送交的是完整内容。程序会打印「(送交 N 字)」，N 即为本次送交的字符数。
 
-- OCR 是主要耗时步骤（尤其是扫描版 PDF）。
-- 本项目已将 OCR 引擎做成进程内复用（不会每个 PDF 重新初始化一次）。
-- 你可以减少 OCR 页数（目前固定前 5 页；如需改成 3 页或 8 页我可以继续帮你改）。
+**Q: 识别速度慢？**  
+A: 可适当减小 `max_chars_for_llm`（如 2000）；非思考型模型可将 `llm.max_tokens` 设为 256。单篇耗时主要来自模型推理。
 
-### 2) LM Studio 请求失败 / model 不存在
+**Q: 结果有时是「生命科学」有时是「未分类」？**  
+A: 已通过 `temperature=0`、未分类时自动重试一次、以及二分类归一化逻辑减少该情况。若仍出现，请确认 `max_tokens` 足够（思考型模型建议 512）。
 
-- 请确认 `config.yaml` 中 `llm.model` 与 LM Studio 暴露的模型名一致。
-- 请确认 LM Studio Server 已启动，并且 `api_base` 端口正确。
-
-### 3) PDF OCR 文本质量一般
-
-- 可尝试提高渲染分辨率（当前 `Matrix(2.0, 2.0)`）。
-- 文献为双栏排版时，OCR 可能出现顺序错乱；后续可加版面分析优化。
+**Q: LM Studio 请求失败 / 模型不存在？**  
+A: 确认 `config.yaml` 中 `llm.model`、`llm.api_base` 与 LM Studio 中一致，且 Server 已启动。

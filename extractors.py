@@ -1,144 +1,206 @@
 # -*- coding: utf-8 -*-
 """
-PDF 阶梯式识别提取器（增强稳定性版）：
-1. 文本层 (PyMuPDF -> 回退到 pypdf)
-2. 主 OCR (Nougat)
-3. 备用 OCR (DocTR)
-4. 兜底 (Tesseract)
+PDF 提取器（RAG 式分块 + 整合，不存文件）：
+1. 从 PDF 取全文（文本层优先，不足时 OCR 兜底）
+2. 按 RAG 思路分块（固定长度 + 重叠）
+3. 将碎片文本整合为一段，供大模型识别领域（不写入任何文件）
 """
 
 from pathlib import Path
-from typing import Tuple
-import os
+from typing import Tuple, List
 
-# 阈值：如果提取文本少于此字符数，则认为需要 OCR
+# 文本过少则视为需 OCR
 MIN_TEXT_THRESHOLD = 200
 
-def extract_via_text_layer(path: Path, max_pages: int) -> str:
-    """第一层：文本提取（多重备份方案）"""
+# 默认分块参数（与常见 RAG 配置一致：按字符近似等价于 ~300–500 token 的块）
+DEFAULT_CHUNK_SIZE = 800
+DEFAULT_CHUNK_OVERLAP = 100
+
+# 文献开头通常为标题、作者、单位、期刊等，单独保留供 AI 综合判断领域（如 xx 医院、xx 大学医学系）
+AUTHOR_SECTION_CHARS = 1200
+
+
+def _extract_text_layer(path: Path, max_pages: int) -> str:
+    """文本层提取：优先 PyMuPDF，回退 pypdf。"""
     text = ""
-    # 尝试方案 A: PyMuPDF (性能最好，但可能报 DLL 错误)
     try:
         import fitz
         doc = fitz.open(str(path))
-        actual_max = min(len(doc), max_pages)
-        for i in range(actual_max):
+        n = min(len(doc), max_pages)
+        for i in range(n):
             text += doc[i].get_text()
         doc.close()
-        if len(text.strip()) > MIN_TEXT_THRESHOLD:
-            print(f"[PyMuPDF 成功] ", end="")
+        if text.strip():
             return text.strip()
-    except Exception as e:
-        print(f" [PyMuPDF 失败: {e}] ", end="")
+    except Exception:
+        pass
 
-    # 尝试方案 B: pypdf (纯 Python，不依赖 DLL，极稳)
     try:
         from pypdf import PdfReader
         reader = PdfReader(path)
-        actual_max = min(len(reader.pages), max_pages)
-        parts = []
-        for i in range(actual_max):
-            t = reader.pages[i].extract_text()
-            if t: parts.append(t)
-        text = "\n".join(parts)
-        if len(text.strip()) > MIN_TEXT_THRESHOLD:
-            print(f"[pypdf 成功] ", end="")
-            return text.strip()
-    except Exception as e:
-        print(f" [pypdf 失败: {e}] ", end="")
-
-    return text.strip()
-
-def extract_via_nougat(path: Path, max_pages: int) -> str:
-    """第二层：Nougat (主 OCR)"""
-    try:
-        import subprocess
-        # 探测命令是否存在
-        result = subprocess.run(
-            ["nougat", str(path), "--pages", f"1-{max_pages}", "--markdown"],
-            capture_output=True, text=True, encoding="utf-8", timeout=300
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
+        n = min(len(reader.pages), max_pages)
+        parts = [reader.pages[i].extract_text() for i in range(n) if reader.pages[i].extract_text()]
+        if parts:
+            return "\n".join(parts).strip()
     except Exception:
         pass
     return ""
 
-def extract_via_doctr(path: Path, max_pages: int) -> str:
-    """第三层：DocTR (备用 OCR)"""
-    try:
-        from doctr.io import DocumentFile
-        from doctr.models import ocr_predictor
-        model = ocr_predictor(pretrained=True)
-        doc = DocumentFile.from_pdf(str(path))
-        result = model(doc[:max_pages])
-        return result.render()
-    except Exception:
-        pass
-    return ""
 
-def extract_via_tesseract(path: Path, max_pages: int) -> str:
-    """第四层：Tesseract (兜底)"""
+def _extract_ocr_fallback(path: Path, max_pages: int) -> str:
+    """OCR 兜底：用 PyMuPDF 渲染页面 + Tesseract 识别。"""
     try:
+        import fitz
         import pytesseract
-        import fitz  # 如果 fitz 挂了，这里尝试用 pypdf 渲染图片的方案（简化版暂用 fitz）
         from PIL import Image
         doc = fitz.open(str(path))
         text = ""
-        actual_max = min(len(doc), max_pages)
-        for i in range(actual_max):
+        n = min(len(doc), max_pages)
+        for i in range(n):
             page = doc[i]
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            text += pytesseract.image_to_string(img, lang='eng')
+            text += pytesseract.image_to_string(img, lang="eng+chi_sim")
         doc.close()
         return text.strip()
     except Exception:
         pass
     return ""
 
-def extract_pdf(path: str, max_pages: int = 5) -> str:
-    """阶梯逻辑入口"""
-    path_obj = Path(path)
-    if not path_obj.exists(): return ""
 
-    # 1. 尝试文本层
-    print(f" (Try Text Layer) ", end="", flush=True)
-    text = extract_via_text_layer(path_obj, max_pages)
-    if len(text) > MIN_TEXT_THRESHOLD:
-        return text
+def chunk_text(
+    text: str,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> List[str]:
+    """
+    RAG 式分块：按字符数切分，块间带重叠，尽量在句/行边界切割。
+    """
+    if not text or chunk_size <= 0:
+        return []
+    text = text.strip()
+    if len(text) <= chunk_size:
+        return [text] if text else []
 
-    # 2. 尝试 Nougat
-    print(f" (Try Nougat) ", end="", flush=True)
-    text = extract_via_nougat(path_obj, max_pages)
-    if len(text) > MIN_TEXT_THRESHOLD:
-        print(f"[Nougat 成功] ", end="")
-        return text
+    chunks: List[str] = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        if end >= len(text):
+            chunk = text[start:].strip()
+            if chunk:
+                chunks.append(chunk)
+            break
+        # 在句号、换行或空格处截断，避免截断单词/中文
+        segment = text[start:end]
+        for sep in ("\n\n", "\n", "。", ".", " ", ""):
+            idx = segment.rfind(sep)
+            if idx > chunk_size // 2:
+                end = start + idx + (len(sep) if sep else 0)
+                break
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start = end - min(overlap, chunk_size - 1)
+    return chunks
 
-    # 3. 尝试 DocTR
-    print(f" (Try DocTR) ", end="", flush=True)
-    text = extract_via_doctr(path_obj, max_pages)
-    if len(text) > MIN_TEXT_THRESHOLD:
-        print(f"[DocTR 成功] ", end="")
-        return text
 
-    # 4. 尝试 Tesseract
-    print(f" (Try Tesseract) ", end="", flush=True)
-    text = extract_via_tesseract(path_obj, max_pages)
-    
-    # 记录结果供调试
-    if text.strip():
-        debug_txt = path_obj.with_suffix(path_obj.suffix + ".ocr.txt")
-        try:
-            debug_txt.write_text(text, encoding="utf-8")
-        except: pass
-    else:
-        print("[所有识别层均告失败] ", end="")
-            
-    return text
+def merge_chunks_for_llm(
+    chunks: List[str],
+    max_chars: int,
+    separator: str = "\n\n",
+) -> str:
+    """
+    将分块文本整合为一段，总长度不超过 max_chars，供 LLM 使用。
+    不写入任何文件。
+    """
+    if not chunks:
+        return ""
+    merged = separator.join(chunks)
+    if len(merged) <= max_chars:
+        return merged
+    # 从开头截断到 max_chars，尽量在句末截断
+    truncated = merged[:max_chars]
+    for sep in ("\n", "。", ".", " "):
+        last = truncated.rfind(sep)
+        if last > max_chars // 2:
+            truncated = truncated[: last + 1]
+            break
+    return truncated.strip()
 
-def extract_title_abstract_body(file_path: str, **kwargs) -> Tuple[str, str, str]:
-    """适配接口"""
+
+def extract_pdf_text(path: str, max_pages: int = 10) -> str:
+    """
+    从 PDF 提取全文：先文本层，不足时 OCR 兜底。
+    不写入任何中间文件。
+    """
+    p = Path(path)
+    if not p.exists():
+        return ""
+
+    raw = _extract_text_layer(p, max_pages)
+    if len(raw) >= MIN_TEXT_THRESHOLD:
+        return raw
+    ocr = _extract_ocr_fallback(p, max_pages)
+    return ocr if ocr else raw
+
+
+def _split_author_and_body(full_text: str, author_chars: int = AUTHOR_SECTION_CHARS) -> Tuple[str, str]:
+    """
+    将文献开头切出「作者与机构」段落（通常含标题、作者、单位、期刊等），
+    便于 AI 结合机构信息（如 xx 医院、xx 大学医学系）综合判断领域。
+    """
+    text = full_text.strip()
+    if not text:
+        return "", ""
+    if len(text) <= author_chars:
+        return text, ""
+    # 尽量在段落边界截断作者区
+    head = text[:author_chars]
+    for sep in ("\n\n", "\n", "。", "."):
+        idx = head.rfind(sep)
+        if idx > author_chars // 2:
+            head = text[: idx + len(sep)].strip()
+            break
+    body = text[len(head) :].strip()
+    return head, body
+
+
+def extract_title_abstract_body(
+    file_path: str,
+    abstract_max: int = 1500,
+    body_pages_chars: int = 2400,
+    max_chars_for_llm: int = 3000,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+    author_section_chars: int = AUTHOR_SECTION_CHARS,
+    **kwargs,
+) -> Tuple[str, str, str]:
+    """
+    对 PDF 做 RAG 式处理：取文 → 拆出作者/机构段 → 正文分块 → 整合给 AI，不存文件。
+    返回 (标题/文件名, 整合内容, "")。整合内容含【作者与机构信息】与【正文与摘要片段】，
+    便于 AI 结合作者、单位、期刊等综合判断（如 xx 医院、xx 大学医学系 → 生命科学）。
+    """
     path = Path(file_path)
-    full_text = extract_pdf(file_path, max_pages=5)
-    return path.name, full_text, ""
+    if path.suffix.lower() != ".pdf":
+        return path.name, "", ""
+
+    max_pages = 15
+    full_text = extract_pdf_text(str(path), max_pages=max_pages)
+    if not full_text.strip():
+        return path.name, "", ""
+
+    # 1) 单独保留文献开头的作者与机构信息（标题、作者、单位、期刊等）
+    author_section, body_text = _split_author_and_body(full_text, author_chars=author_section_chars)
+    prefix = "【作者与机构信息】\n" + author_section + "\n\n【正文与摘要片段】\n"
+    budget = max(0, max_chars_for_llm - len(prefix))
+
+    # 2) 正文分块并合并，总长不超过 budget
+    if body_text:
+        chunks = chunk_text(body_text, chunk_size=chunk_size, overlap=chunk_overlap)
+        body_merged = merge_chunks_for_llm(chunks, max_chars=budget)
+    else:
+        body_merged = ""
+
+    content = prefix + body_merged
+    return path.name, content.strip(), ""

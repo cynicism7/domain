@@ -7,7 +7,11 @@ llm:
   model: "DeepSeek-R1-0528-Qwen3-8B"
   api_base: "http://127.0.0.1:1234/v1"
   api_key: "lm-studio"
-max_chars_for_llm: 3000
+  # R1/思考型模型会先输出 <think>，需 512 才能容纳推理+JSON；非思考型可改为 256
+  max_tokens: 512
+  temperature: 0.0   # 利于稳定输出 JSON，减少“能/不能分类”交替
+# 送交模型的文献片段最大字符数，适当减小可提速（如 2000）
+max_chars_for_llm: 2500
 output:
   db_path: "./literature_domains.db"
   export_csv: True

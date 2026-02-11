@@ -78,23 +78,27 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
         print("【模拟模式】未调用大模型，使用简单规则生成领域标签，仅用于验证流程。\n")
 
     conn = ensure_db(db_path)
-    body_chars = min(2400, max(1200, max_chars // 2))  # 正文前两页约 2400 字
-    abstract_chars = min(1500, max_chars - body_chars)
     total = len(files)
     for i, fp in enumerate(files, 1):
         name = Path(fp).name
         print(f"[{i}/{total}] {name} ... ", end="", flush=True)
-        title, abstract, _ = extract_title_abstract_body(
-            fp, abstract_max=abstract_chars, body_pages_chars=body_chars
+        # RAG 式：分块后整合成一段，不存文件，长度受 max_chars 限制
+        title, content_for_llm, _ = extract_title_abstract_body(
+            fp, max_chars_for_llm=max_chars
         )
+        # 说明：LM Studio 等日志里的 "<Truncated in logs>" 只是显示截断，实际请求里送交的是完整内容
+        n_chars = len(content_for_llm or "")
+        print(f"(送交 {n_chars} 字) ", end="", flush=True)
         provider = "mock" if use_mock else llm_cfg.get("provider", "ollama")
         domain_cn, domain_en = identify_domain(
             title,
-            abstract,
+            content_for_llm,
             provider=provider,
             model=llm_cfg.get("model", "qwen2.5:7b"),
             api_base=llm_cfg.get("api_base", "http://localhost:1234/v1"),
             api_key=llm_cfg.get("api_key", "not-needed"),
+            max_tokens=llm_cfg.get("max_tokens", 512),
+            temperature=llm_cfg.get("temperature", 0.0),
         )
         upsert_domain(conn, fp, domain_cn, domain_en)
         print(f"{domain_cn} | {domain_en}")

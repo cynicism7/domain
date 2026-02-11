@@ -2,7 +2,7 @@
 """本地大模型调用：支持 Ollama 与 OpenAI 兼容 API（如 LM Studio）。"""
 
 import re
-from typing import Optional
+from typing import Optional, Tuple
 
 
 def _normalize_domain(raw: str) -> str:
@@ -49,8 +49,10 @@ def ask_openai_api(
     api_base: str = "http://localhost:1234/v1",
     api_key: str = "not-needed",
     timeout: int = 120,
+    max_tokens: int = 512,
+    temperature: float = 0.0,
 ) -> str:
-    """通过 OpenAI 兼容 API（如 LM Studio）请求。"""
+    """通过 OpenAI 兼容 API（如 LM Studio）请求。temperature=0 利于稳定输出 JSON。"""
     try:
         from openai import OpenAI
     except ImportError:
@@ -60,7 +62,8 @@ def ask_openai_api(
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=100,
+            max_tokens=max_tokens,
+            temperature=temperature,
             timeout=timeout,
         )
         msg = resp.choices[0].message.content if resp.choices else ""
@@ -80,76 +83,112 @@ def identify_domain(
     model: str = "qwen2.5:7b",
     api_base: str = "http://localhost:1234/v1",
     api_key: str = "not-needed",
+    max_tokens: int = 512,
+    temperature: float = 0.0,
 ) -> tuple[str, str]:
     """
     调用本地大模型识别领域，返回 (domain_cn, domain_en)。
+    未分类时会自动重试一次，以提高稳定性。
     """
-    prompt = """请根据下面文献的内容，判断其所属的学术领域。
-要求：
-1. 返回一个标准的学术领域名称（如：计算机科学/Computer Science, 生物信息学/Bioinformatics）。
-2. 必须以 JSON 格式返回，包含 "domain_cn" 和 "domain_en" 两个字段。
-3. 领域名称要准确、专业。
+    prompt = """请根据下面文献判断：是否属于「生命科学」相关（用于粗筛，只需二选一）。
+可综合参考：标题、摘要、正文、作者、机构与期刊（如 xx 医院、xx 大学医学/生物/药学系、医学院、生命科学学院、生物所等均属生命科学相关）。
+生命科学包含：医学、生物学、药学、农学、生物信息学、生物工程、兽医学等；其余归为非生命科学。
+要求：不要使用 <think>，直接输出一行 JSON。仅两个取值：
+- domain_cn 为 "生命科学" 或 "非生命科学"
+- domain_en 为 "Life Science" 或 "Non-Life Science"
 
-【文件名或标题 / Title or Filename】
+【文件名或标题】
 %s
 
-【前五页OCR全文 / OCR Full Text (First 5 Pages)】
+【文献内容（含作者与机构信息、正文片段）】
 %s
 
-JSON Output:""" % (
+只输出一行 JSON，例如：{"domain_cn": "生命科学", "domain_en": "Life Science"}""" % (
         (title or "Unknown").strip(),
         (full_text or "No Content Detected").strip(),
     )
 
     if provider == "mock":
-        return _identify_domain_mock(title or "", "", full_text or ""), "Test Domain"
-    
-    raw = ""
-    if provider == "openai_api":
-        raw = ask_openai_api(prompt, model=model, api_base=api_base, api_key=api_key)
-    else:
-        raw = ask_ollama(prompt, model=model)
-    
-    # 解析 JSON
-    try:
-        # 寻找 JSON 块
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            data = json.loads(match.group(0))
-            return data.get("domain_cn", "未分类"), data.get("domain_en", "Unclassified")
-    except:
-        pass
-    
-    # 兜底：简单切割
-    if "|" in raw:
-        parts = raw.split("|")
-        return parts[0].strip(), parts[1].strip()
-    
-    return _normalize_domain(raw), "Unclassified"
+        cn = _identify_domain_mock(title or "", "", full_text or "")
+        en = "Life Science" if cn == "生命科学" else "Non-Life Science"
+        return cn, en
+
+    def _call() -> str:
+        if provider == "openai_api":
+            return ask_openai_api(
+                prompt, model=model, api_base=api_base, api_key=api_key,
+                max_tokens=max_tokens, temperature=temperature,
+            )
+        return ask_ollama(prompt, model=model)
+
+    def _normalize_binary(domain_cn: str, domain_en: str) -> Tuple[str, str]:
+        """统一为二分类：生命科学 / 非生命科学。须先判「非生命」再判「生命」，避免「非生命科学」被误判。"""
+        cn = (domain_cn or "").strip()
+        en = (domain_en or "").strip().lower()
+        if "非生命" in cn or "non-life" in en or "non_life" in en:
+            return "非生命科学", "Non-Life Science"
+        if "生命科学" in cn or "life science" in en or "life" in en or "medical" in en or "bio" in en or "生命" in cn:
+            return "生命科学", "Life Science"
+        return "非生命科学", "Non-Life Science"
+
+    def _parse(raw: str) -> Optional[Tuple[str, str]]:
+        if not raw:
+            return None
+        if "</think>" in raw:
+            raw = raw.split("</think>")[-1]
+        try:
+            for m in re.finditer(r'\{[^{}]*"domain_cn"[^{}]*"domain_en"[^{}]*\}', raw):
+                try:
+                    data = json.loads(m.group(0))
+                    if "domain_cn" in data and "domain_en" in data:
+                        return _normalize_binary(
+                            data.get("domain_cn", ""), data.get("domain_en", "")
+                        )
+                except (json.JSONDecodeError, ValueError):
+                    continue
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group(0))
+                return _normalize_binary(
+                    data.get("domain_cn", ""), data.get("domain_en", "")
+                )
+        except (json.JSONDecodeError, ValueError, KeyError):
+            pass
+        if "|" in raw:
+            parts = raw.split("|")
+            if len(parts) >= 2:
+                return _normalize_binary(parts[0].strip(), parts[1].strip())
+        return None
+
+    raw = _call()
+    result = _parse(raw)
+    if result is not None and result[0] not in ("", "未分类"):
+        return result
+    raw2 = _call()
+    result = _parse(raw2)
+    if result is not None:
+        return result
+    # 解析失败时根据回复文本猜测二分类（先判非生命，再判生命）
+    s = raw2 or raw or ""
+    r = s.lower()
+    if "非生命" in s or "non-life" in r:
+        return "非生命科学", "Non-Life Science"
+    if "生命科学" in s or "life science" in r or "medical" in r or "biology" in r:
+        return "生命科学", "Life Science"
+    return "非生命科学", "Non-Life Science"
 
 
 def _identify_domain_mock(title: str, abstract: str, body: str) -> str:
     """
-    模拟领域识别：不调用任何大模型，根据标题/摘要/正文做简单关键词匹配，
-    用于本地无大模型时验证程序流程（扫描、提取、入库、导出、筛选）。
+    模拟二分类：根据标题/摘要/正文/机构关键词判断是否生命科学，用于本地验证流程。
     """
     text = (title + " " + abstract + " " + body).lower()
-    # 简单关键词 -> 领域（可自行扩展）
-    rules = [
-        ("network", "计算机科学"),
-        ("deep learning", "计算机科学"),
-        ("algorithm", "计算机科学"),
-        ("生物", "生物学"),
-        ("基因", "生物学"),
-        ("经济", "经济学"),
-        ("金融", "经济学"),
-        ("物理", "物理学"),
-        ("医学", "医学"),
-        ("法律", "法学"),
+    life_keywords = [
+        "medical", "medicine", "hospital", "生物", "医学", "药学", "生命科学",
+        "biology", "biolog", "pharmacy", "pharmac", "医学院", "医学系", "生物系",
+        "agriculture", "农学", "兽医", "基因", "cell", "clinical", "肿瘤", "癌症",
     ]
-    for kw, domain in rules:
+    for kw in life_keywords:
         if kw in text:
-            return domain
-    # 无匹配时按标题哈希得到几种固定标签，便于测试「按领域筛选」
-    n = (hash(title or "x") % 5) + 1
-    return f"测试领域-{n}"
+            return "生命科学"
+    return "非生命科学"

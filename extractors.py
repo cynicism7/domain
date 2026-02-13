@@ -16,10 +16,6 @@ MIN_TEXT_THRESHOLD = 200
 DEFAULT_CHUNK_SIZE = 800
 DEFAULT_CHUNK_OVERLAP = 100
 
-# 文献开头通常为标题、作者、单位、期刊等，单独保留供 AI 综合判断领域（如 xx 医院、xx 大学医学系）
-AUTHOR_SECTION_CHARS = 1200
-
-
 def _extract_text_layer(path: Path, max_pages: int) -> str:
     """文本层提取：优先 PyMuPDF，回退 pypdf。"""
     text = ""
@@ -145,62 +141,127 @@ def extract_pdf_text(path: str, max_pages: int = 10) -> str:
     return ocr if ocr else raw
 
 
-def _split_author_and_body(full_text: str, author_chars: int = AUTHOR_SECTION_CHARS) -> Tuple[str, str]:
-    """
-    将文献开头切出「作者与机构」段落（通常含标题、作者、单位、期刊等），
-    便于 AI 结合机构信息（如 xx 医院、xx 大学医学系）综合判断领域。
-    """
+# 仅向 AI 提供四部分时的字符上限（控制 token）
+TITLE_MAX_CHARS = 200
+AUTHOR_MAX_CHARS = 200
+AFFILIATION_MAX_CHARS = 300
+ABSTRACT_MAX_CHARS = 600
+
+
+def _find_abstract_span(text: str) -> Tuple[int, int]:
+    """找到摘要段的起止位置（Abstract/摘要 到 Introduction/Keywords 等）。"""
+    text_lower = text.lower()
+    start = -1
+    for mark in ("abstract", "摘要", "summary"):
+        i = text_lower.find(mark)
+        if i != -1 and (start == -1 or i < start):
+            start = i
+    if start == -1:
+        return -1, -1
+    line_end = text.find("\n", start)
+    if line_end != -1:
+        start = line_end + 1
+    else:
+        start = start + 8
+    search_region = text[start : start + 2000]
+    end_in_region = len(search_region)
+    for mark in ("introduction", "1. introduction", "keywords", "key words", "索引", "1. ", "\n1.\t"):
+        j = search_region.lower().find(mark)
+        if j != -1 and j < end_in_region:
+            end_in_region = j
+    return start, start + end_in_region
+
+
+def _truncate(s: str, max_chars: int) -> str:
+    if not s or max_chars <= 0:
+        return ""
+    s = s.strip()
+    if len(s) <= max_chars:
+        return s
+    t = s[:max_chars]
+    for sep in ("\n", "。", ".", " "):
+        idx = t.rfind(sep)
+        if idx > max_chars // 2:
+            return t[: idx + 1].strip()
+    return t.strip()
+
+
+def _extract_title_author_affiliation_abstract(full_text: str, filename: str) -> Tuple[str, str, str, str]:
+    """从全文抽取：标题、作者、研究团队（机构）、摘要。"""
     text = full_text.strip()
-    if not text:
-        return "", ""
-    if len(text) <= author_chars:
-        return text, ""
-    # 尽量在段落边界截断作者区
-    head = text[:author_chars]
-    for sep in ("\n\n", "\n", "。", "."):
-        idx = head.rfind(sep)
-        if idx > author_chars // 2:
-            head = text[: idx + len(sep)].strip()
-            break
-    body = text[len(head) :].strip()
-    return head, body
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+    title_lines = []
+    for i, ln in enumerate(lines[:4]):
+        if len(ln) > 10 and not ln.lower().startswith(("http", "www.")):
+            title_lines.append(ln)
+            if i >= 1 or len(ln) > 80:
+                break
+    title = _truncate(" ".join(title_lines), TITLE_MAX_CHARS) if title_lines else filename
+
+    abs_start, abs_end = _find_abstract_span(text)
+    abstract = ""
+    if abs_start >= 0 and abs_end > abs_start:
+        abstract = _truncate(text[abs_start:abs_end], ABSTRACT_MAX_CHARS)
+
+    block_before_abstract = text[:abs_start].strip() if abs_start > 0 else text[:800].strip()
+    for ln in title_lines:
+        block_before_abstract = block_before_abstract.replace(ln, "", 1).strip()
+    before_lines = [ln for ln in block_before_abstract.split("\n") if ln.strip()]
+    author_parts = []
+    affiliation_parts = []
+    affil_keywords = ("department", "university", "hospital", "school", "college", "institute", "laboratory", "lab ", "学院", "大学", "系", "所", "医院", "实验室")
+    for ln in before_lines[:20]:
+        ln_lower = ln.lower()
+        if any(kw in ln_lower for kw in affil_keywords) or len(ln) > 60:
+            affiliation_parts.append(ln)
+        else:
+            author_parts.append(ln)
+    author = _truncate("\n".join(author_parts), AUTHOR_MAX_CHARS)
+    affiliation = _truncate("\n".join(affiliation_parts), AFFILIATION_MAX_CHARS)
+    if not author and before_lines:
+        author = _truncate("\n".join(before_lines[:5]), AUTHOR_MAX_CHARS)
+    if not affiliation and before_lines and not author:
+        affiliation = _truncate("\n".join(before_lines[:8]), AFFILIATION_MAX_CHARS)
+
+    return title, author, affiliation, abstract
 
 
 def extract_title_abstract_body(
     file_path: str,
     abstract_max: int = 1500,
     body_pages_chars: int = 2400,
-    max_chars_for_llm: int = 3000,
+    max_chars_for_llm: int = 1500,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
-    author_section_chars: int = AUTHOR_SECTION_CHARS,
+    author_section_chars: int = 1200,
     **kwargs,
 ) -> Tuple[str, str, str]:
     """
-    对 PDF 做 RAG 式处理：取文 → 拆出作者/机构段 → 正文分块 → 整合给 AI，不存文件。
-    返回 (标题/文件名, 整合内容, "")。整合内容含【作者与机构信息】与【正文与摘要片段】，
-    便于 AI 结合作者、单位、期刊等综合判断（如 xx 医院、xx 大学医学系 → 生命科学）。
+    仅向 AI 提供：标题、作者、研究团队、摘要，以降低输入 token。
+    返回 (文件名, 四部分整合文本, "")。
     """
     path = Path(file_path)
     if path.suffix.lower() != ".pdf":
         return path.name, "", ""
 
-    max_pages = 15
-    full_text = extract_pdf_text(str(path), max_pages=max_pages)
+    full_text = extract_pdf_text(str(path), max_pages=5)
     if not full_text.strip():
         return path.name, "", ""
 
-    # 1) 单独保留文献开头的作者与机构信息（标题、作者、单位、期刊等）
-    author_section, body_text = _split_author_and_body(full_text, author_chars=author_section_chars)
-    prefix = "【作者与机构信息】\n" + author_section + "\n\n【正文与摘要片段】\n"
-    budget = max(0, max_chars_for_llm - len(prefix))
-
-    # 2) 正文分块并合并，总长不超过 budget
-    if body_text:
-        chunks = chunk_text(body_text, chunk_size=chunk_size, overlap=chunk_overlap)
-        body_merged = merge_chunks_for_llm(chunks, max_chars=budget)
-    else:
-        body_merged = ""
-
-    content = prefix + body_merged
+    title, author, affiliation, abstract = _extract_title_author_affiliation_abstract(
+        full_text, path.name
+    )
+    parts = []
+    if title:
+        parts.append("【标题】\n" + title)
+    if author:
+        parts.append("【作者】\n" + author)
+    if affiliation:
+        parts.append("【研究团队/机构】\n" + affiliation)
+    if abstract:
+        parts.append("【摘要】\n" + abstract)
+    content = "\n\n".join(parts)
+    if len(content) > max_chars_for_llm:
+        content = _truncate(content, max_chars_for_llm)
     return path.name, content.strip(), ""

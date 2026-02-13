@@ -63,7 +63,7 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
     dirs = cfg.get("literature_dirs", ["./papers"])
     exts = cfg.get("extensions", [".pdf", ".docx", ".doc", ".txt"])
     llm_cfg = cfg.get("llm", {})
-    max_chars = cfg.get("max_chars_for_llm", 3000)
+    max_chars = cfg.get("max_chars_for_llm", 800)
     out = cfg.get("output", {})
     db_path = out.get("db_path", "./literature_domains.db")
     do_csv = out.get("export_csv", True)
@@ -97,7 +97,7 @@ def run_scan(config_path: str = "config.yaml", use_mock: bool = False) -> None:
             model=llm_cfg.get("model", "qwen2.5:7b"),
             api_base=llm_cfg.get("api_base", "http://localhost:1234/v1"),
             api_key=llm_cfg.get("api_key", "not-needed"),
-            max_tokens=llm_cfg.get("max_tokens", 512),
+            max_tokens=llm_cfg.get("max_tokens", 128),
             temperature=llm_cfg.get("temperature", 0.0),
         )
         upsert_domain(conn, fp, domain_cn, domain_en)

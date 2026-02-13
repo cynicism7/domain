@@ -90,20 +90,16 @@ def identify_domain(
     调用本地大模型识别领域，返回 (domain_cn, domain_en)。
     未分类时会自动重试一次，以提高稳定性。
     """
-    prompt = """请根据下面文献判断：是否属于「生命科学」相关（用于粗筛，只需二选一）。
-可综合参考：标题、摘要、正文、作者、机构与期刊（如 xx 医院、xx 大学医学/生物/药学系、医学院、生命科学学院、生物所等均属生命科学相关）。
-生命科学包含：医学、生物学、药学、农学、生物信息学、生物工程、兽医学等；其余归为非生命科学。
-要求：不要使用 <think>，直接输出一行 JSON。仅两个取值：
-- domain_cn 为 "生命科学" 或 "非生命科学"
-- domain_en 为 "Life Science" 或 "Non-Life Science"
+    prompt = """判断文献是否属「生命科学」相关（医学/生物/药学/农学/生物信息等），二选一。不要 <think>，只输出一行 JSON。
+domain_cn 取 "生命科学" 或 "非生命科学"，domain_en 取 "Life Science" 或 "Non-Life Science"。可参考标题、作者、机构、摘要。
 
-【文件名或标题】
+【文件名】
 %s
 
-【文献内容（含作者与机构信息、正文片段）】
+【标题、作者、研究团队、摘要】
 %s
 
-只输出一行 JSON，例如：{"domain_cn": "生命科学", "domain_en": "Life Science"}""" % (
+只输出一行 JSON：""" % (
         (title or "Unknown").strip(),
         (full_text or "No Content Detected").strip(),
     )
